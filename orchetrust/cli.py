@@ -8,9 +8,15 @@ import json
 from typing import Optional
 from .discovery.filesystem import scan_filesystem
 from pathlib import Path
+import sqlite3
+from .display.tables import print_certificates_table
+from .storage.db import Inventory
 
 
 app = typer.Typer(add_completion=False, help="OrcheTrust CLI")
+
+inventory_app = typer.Typer(help="Inventory commands")
+app.add_typer(inventory_app, name="inventory")
 
 @app.callback()
 def main(ctx: typer.Context):
@@ -20,6 +26,60 @@ def main(ctx: typer.Context):
     ctx.obj = {}
     ctx.obj["logger"] = get_logger()
     ctx.obj["config"] = Config.load()
+
+@inventory_app.command("list")
+def inventory_list(
+    source: Optional[str] = typer.Option(None, "--source", help='Filter by source, e.g. "filesystem"'),
+    expiring_within: Optional[int] = typer.Option(None, "--expiring-within", help="Days until expiry threshold"),
+    json_out: bool = typer.Option(False, "--json", help="Output JSON instead of table."),
+):
+    """List stored certificates in the inventory."""
+    cfg = Config.load()
+    inv = Inventory(cfg.db_path)
+    rows = inv.list(source=source, expiring_within_days=expiring_within)
+    inv.close()
+
+    if json_out:
+        typer.echo(json.dumps(rows, indent=2, default=str))
+        raise typer.Exit()
+
+    from rich.table import Table
+    from rich import print as rprint
+
+    table = Table(title="Inventory")
+    for c in ["Source", "Location", "Subject", "Issuer", "Not After", "Days Left", "SANs", "First Seen", "Last Seen"]:
+        table.add_column(c, overflow="fold")
+
+    for r in rows:
+        table.add_row(
+            r.get("source") or "",
+            r.get("location") or "",
+            r.get("subject") or "",
+            r.get("issuer") or "",
+            r.get("not_after") or "",
+            str(r.get("days_left") if r.get("days_left") is not None else ""),
+            ", ".join(r.get("sans") or []),
+            r.get("first_seen") or "",
+            r.get("last_seen") or "",
+        )
+    rprint(table)
+
+@inventory_app.command("purge")
+def inventory_purge(
+    source: Optional[str] = typer.Option(None, "--source", help='Purge only a source, e.g. "filesystem"'),
+    yes: bool = typer.Option(False, "--yes", help="Do not prompt for confirmation."),
+):
+    """Delete inventory entries (all or by source)."""
+    if not yes:
+        typer.confirm(
+            f"This will delete {'ALL entries' if not source else f'entries with source={source}'} from the inventory. Continue?",
+            abort=True
+        )
+    cfg = Config.load()
+    inv = Inventory(cfg.db_path)
+    deleted = inv.purge(source=source)
+    inv.close()
+    typer.echo(f"Deleted {deleted} row(s).")
 
 @app.command()
 def version():
@@ -39,19 +99,29 @@ def status():
     table.add_column("Key")
     table.add_column("Value")
     table.add_row("Version", __version__)
+    table.add_row("DB Path", cfg.db_path)
     table.add_row("Slack Webhook", "set" if cfg.slack_webhook_url else "not set")
     table.add_row("Configured Scan Paths", ", ".join(cfg.scan_paths) if cfg.scan_paths else "(none)")
     rprint(table)
 
 @app.command()
+def inventory ():
+    """Show inventory of managed certificates."""
+    log = get_logger()
+    log.info("Fetching managed certificates from the database.")
+    certificates = read_certificates(conn)
+    print_certificates_table("Inventoried Certificates", certificates)
+
+@app.command()
 def scan(
-path: list[str] = typer.Option(
+    path: list[str] = typer.Option(
         None,
         "--path",
         "-p",
         help="Path(s) to scan (comma-separated). Example: --path /etc/ssl,/etc/nginx",
     ),
     json_out: bool = typer.Option(False, "--json", help="Output JSON instead of a table."),
+    write_db: bool = typer.Option(False, "--write-db", help="Persist results to inventory DB."),
 ):
     """
     Scan local filesystem for certificates (.pem/.crt/.cer) and show expiry.
@@ -71,6 +141,12 @@ path: list[str] = typer.Option(
     log.info(f"Scanning paths: {paths}")
     rows = scan_filesystem(paths)
 
+    if write_db:
+        inv = Inventory(cfg.db_path)
+        count = inv.upsert_many(rows)
+        inv.close()
+        log.info(f"Wrote {count} records to inventory")
+
     if json_out:
         typer.echo(json.dumps(rows, indent=2, default=str))
         raise typer.Exit()
@@ -85,14 +161,14 @@ path: list[str] = typer.Option(
     for r in rows:
         table.add_row(
             r["source"],
-            r["path"],
-            r["subject"],
-            r["issuer"],
-            r["not_after"],
-            str(r["days_left"]),
-            ", ".join(r["sans"]) if r["sans"] else "-",
+            r.get("path") or "",
+            r.get("subject") or "",
+            r.get("issuer") or "",
+            r.get("not_after") or "",
+            str(r.get("days_left") if r.get("days_left") is not None else ""),
+            ", ".join(r.get("sans") or []) if r.get("sans") else "-",
         )
     rprint(table)
-
+    
 if __name__ == "__main__":
     app()
