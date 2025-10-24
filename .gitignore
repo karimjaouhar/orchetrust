@@ -2,3 +2,6 @@
 __pycache__
 CLAUDE.md
 data/
+orchetrust.yaml
+config.yaml
+config.yml
